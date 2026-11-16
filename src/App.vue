@@ -1,13 +1,11 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { readPlayerParams, resolveStream } from './stream-url.js'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { readPlayerParams, resolveStream, writePlayerParams } from './stream-url.js'
 
 const initial = readPlayerParams(location.search)
 const source = ref(initial.source)
-const origin = ref(initial.origin)
-const direct = ref(initial.direct)
-const format = ref(initial.direct ? 'flv' : initial.format)
-const directFormat = ref(initial.direct ? initial.format : 'auto')
+const streamPath = ref(initial.streamPath)
+const format = ref(initial.format)
 const video = ref(null)
 const active = ref(false)
 const hasVideo = ref(false)
@@ -18,6 +16,32 @@ const playbackUrl = ref('')
 let disposePlayer
 let session = 0
 let connectionTimer
+
+let restoringFromUrl = false
+let muted = initial.muted
+
+watch([source, streamPath, format], ([address, path, protocol]) => {
+  if (restoringFromUrl) return
+  const url = new URL(location.href)
+  url.search = writePlayerParams(url.search, { source: address, streamPath: path, format: protocol })
+  if (url.href !== location.href) history.replaceState(history.state, '', url.href)
+}, { flush: 'sync' })
+
+function restoreFromUrl() {
+  const params = readPlayerParams(location.search)
+  const sourceChanged = source.value !== params.source ||
+    streamPath.value !== params.streamPath || format.value !== params.format
+
+  restoringFromUrl = true
+  source.value = params.source
+  streamPath.value = params.streamPath
+  format.value = params.format
+  restoringFromUrl = false
+  muted = params.muted
+
+  if (params.autoplay) play()
+  else if (sourceChanged) stop()
+}
 
 function clearConnectionTimer() {
   clearTimeout(connectionTimer)
@@ -72,9 +96,8 @@ async function play() {
   try {
     stream = resolveStream({
       source: source.value,
-      origin: origin.value.trim(),
-      format: direct.value ? directFormat.value : format.value,
-      direct: direct.value,
+      streamPath: streamPath.value,
+      format: format.value,
       secure: location.protocol === 'https:',
     })
   } catch (reason) {
@@ -87,9 +110,11 @@ async function play() {
   active.value = true
   status.value = '正在连接'
   playbackUrl.value = stream.url
-  element.muted = initial.muted
+  element.muted = muted
 
-  const connectionError = '无法读取直播流，请确认已开始推流、播放服务可访问且允许跨域请求。'
+  const connectionError = stream.url.startsWith('https:')
+    ? '无法读取直播流，请检查推流状态、跨域设置和浏览器是否信任服务证书。'
+    : '无法读取直播流，请确认已开始推流、播放服务可访问且允许跨域请求。'
   connectionTimer = setTimeout(() => {
     if (current === session) failed('连接超时。' + connectionError)
   }, 25000)
@@ -157,18 +182,14 @@ async function play() {
   }
 }
 
-function changeMode(useDirect) {
-  if (direct.value === useDirect) return
-  stop()
-  source.value = ''
-  direct.value = useDirect
-  status.value = '等待播放'
-}
-
 onMounted(() => {
+  window.addEventListener('popstate', restoreFromUrl)
   if (initial.autoplay) play()
 })
-onBeforeUnmount(release)
+onBeforeUnmount(() => {
+  window.removeEventListener('popstate', restoreFromUrl)
+  release()
+})
 </script>
 
 <template>
@@ -212,13 +233,8 @@ onBeforeUnmount(release)
 
       <section class="settings-panel" aria-labelledby="settings-heading">
         <h2 id="settings-heading">直播源</h2>
-        <div class="mode-switch" role="group" aria-label="地址类型">
-          <button type="button" :aria-pressed="!direct" @click="changeMode(false)">RTMP 地址</button>
-          <button type="button" :aria-pressed="direct" @click="changeMode(true)">播放地址</button>
-        </div>
-
         <form @submit.prevent="play">
-          <label for="stream-source">{{ direct ? 'HTTP 播放地址' : 'RTMP 推流地址' }}</label>
+          <label for="stream-source">SRS 服务或完整播放地址</label>
           <input
             id="stream-source"
             v-model="source"
@@ -226,36 +242,26 @@ onBeforeUnmount(release)
             inputmode="url"
             autocomplete="off"
             spellcheck="false"
-            :placeholder="direct ? 'http://localhost:8080/live/camera1.m3u8' : 'rtmp://localhost:1935/live/camera1'"
+            placeholder="https://srs.example.com"
             required
           />
 
+          <label for="stream-path">SRS 流路径（填写完整播放地址时留空）</label>
+          <input
+            id="stream-path"
+            v-model="streamPath"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="live/test"
+          />
+
           <label for="stream-format">播放协议</label>
-          <select v-if="direct" id="stream-format" v-model="directFormat">
-            <option value="auto">根据播放地址自动识别</option>
+          <select id="stream-format" v-model="format">
+            <option value="auto">自动（SRS 默认 HLS）</option>
             <option value="flv">HTTP-FLV · 低延迟</option>
             <option value="hls">HLS · 兼容移动端</option>
           </select>
-          <template v-else>
-            <select id="stream-format" v-model="format">
-              <option value="flv">HTTP-FLV · 低延迟</option>
-              <option value="hls">HLS · 兼容移动端</option>
-            </select>
-
-            <label for="stream-origin">SRS 播放服务 <span class="optional">可选</span></label>
-            <input
-              id="stream-origin"
-              v-model="origin"
-              type="text"
-              inputmode="url"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="http://localhost:8080"
-              aria-describedby="origin-help"
-            />
-            <small id="origin-help">留空时使用推流主机的 HTTP 8080 端口或 HTTPS 默认端口。</small>
-          </template>
-
           <div class="actions">
             <button class="primary" type="submit">{{ active ? '重新连接' : '开始播放' }}</button>
             <button class="secondary" type="button" :disabled="!active" @click="stop">停止</button>
